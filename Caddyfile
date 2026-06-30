@@ -1,0 +1,13 @@
+{
+	admin off
+}
+
+# CADDY_DOMAIN 留空(默认 localhost)=本地反代无 TLS；填 example.com=自动 HTTPS
+{$CADDY_DOMAIN:localhost} {
+	handle /api/* {
+		reverse_proxy api:8000
+	}
+	handle {
+		reverse_proxy web:3000
+	}
+}

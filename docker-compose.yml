@@ -1,0 +1,80 @@
+services:
+  redis:
+    image: redis:7-alpine
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+
+  api:
+    build: ./apps/api
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - STORAGE_ROOT=/app/storage
+      - SQLITE_PATH=/app/storage/app.db
+      - CORS_ORIGINS=${CORS_ORIGINS:-http://localhost:3000}
+    restart: unless-stopped
+    volumes:
+      - storage:/app/storage
+    ports:
+      - "8000:8000"
+    depends_on:
+      redis:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request,sys; sys.exit(0 if urllib.request.urlopen('http://localhost:8000/api/health').status==200 else 1)"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+
+  worker:
+    build: ./apps/api
+    command: ["python", "-m", "app.worker"]
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      - REDIS_URL=redis://redis:6379/0
+      - STORAGE_ROOT=/app/storage
+      - SQLITE_PATH=/app/storage/app.db
+    volumes:
+      - storage:/app/storage
+    depends_on:
+      redis:
+        condition: service_healthy
+      api:
+        condition: service_started
+
+  web:
+    build:
+      context: ./apps/web
+      args:
+        - NEXT_PUBLIC_API_BASE_URL=${WEB_API_BASE_URL:-}
+    environment:
+      - NEXT_PUBLIC_API_BASE_URL=${WEB_API_BASE_URL:-}
+      - API_PROXY_TARGET=http://api:8000
+    ports:
+      - "3000:3000"
+    depends_on:
+      - api
+
+  caddy:
+    image: caddy:2-alpine
+    environment:
+      - CADDY_DOMAIN=${CADDY_DOMAIN:-}
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+      - caddy_data:/data
+      - caddy_config:/config
+    depends_on:
+      - web
+      - api
+
+volumes:
+  storage:
+  caddy_data:
+  caddy_config:

@@ -1,0 +1,27 @@
+# 依赖与构建产物
+node_modules/
+.next/
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+
+# 运行时数据（上传/结果/workdirs/SQLite）
+storage/
+
+# 机密配置（含真实 key，严禁提交）
+.env
+
+# 本地工具 / 个人配置（不入库）
+CLAUDE.md
+.DS_Store
+.idea/
+.vscode/
+*.log
+
+# omc / Claude 工具运行时状态（会被插件自动重建）
+.omc/
+.claude/
+
+# 大体积测试数据（不入库，保留本地）
+office_multimodal_test_pack/
