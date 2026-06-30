@@ -4,104 +4,37 @@
 从公网回拉音频文件（不接受二进制上传）。文档：
 https://www.volcengine.com/docs/6561/1354868
 
-因此需要两件事配合：
-1. PUBLIC_BASE_URL —— 应用对外可达的公网基址（Caddy 域名 / 隧道），用于拼装音频 URL；
-2. GET /api/asr-source/{token} —— 无状态 HMAC 签名的临时音频下载端点（见 routers/asr_source.py），
-   token 由本模块 `sign_source_token` 生成、`verify_source_token` 校验，worker 与 api 共享同一密钥。
-
+公网回拉所需的签名 token / 路径辅助已抽到 `app.providers.asr_source`（与阿里云 filetrans 共用）。
 鉴权（新版控制台，单 key）：X-Api-Key + X-Api-Resource-Id + X-Api-Request-Id（+ 提交时 X-Api-Sequence=-1）。
 状态码在 response header `X-Api-Status-Code`：20000000 成功 / 01 处理中 / 02 排队 / 03 静音 / 45000001 参数无效 / 550xxxx 内部错误。
 """
 from __future__ import annotations
 
 import asyncio
-import base64
-import hashlib
-import hmac
 import time
 import uuid
 from pathlib import Path
-from urllib.parse import urlparse
 
 from app.config import settings
 from app.errors import ConversionError, ErrorCode
 from app.providers.base import ASRProvider, ASRResult
 
+# 共享：签名 token、路径、公网校验（向后兼容重导出，供旧测试/路由引用）
+from app.providers.asr_source import (  # noqa: F401
+    is_local_url,
+    rel_under_storage,
+    require_public_base,
+    sign_source_token,
+    verify_source_token,
+)
+
 _SUBMIT_PATH = "/submit"
 _QUERY_PATH = "/query"
 
-# 火山接受的容器格式：扩展名 -> (提交 format 字段, 下载 content-type)
-_ACCEPTED = {
-    ".mp3": ("mp3", "audio/mpeg"),
-    ".wav": ("wav", "audio/wav"),
-    ".ogg": ("ogg", "audio/ogg"),
-}
-# 不在 _ACCEPTED 内的源格式（m4a/aac/flac/...）需 ffmpeg 转码到 mp3
-_TRANSCODE_BIN_KB = 64  # 转码 mp3 比特率（语音 64k 足够，减小回拉体积）
-
-
-# ---------------- 无状态签名 token（worker 签发，api 校验）----------------
-
-def _b64url(b: bytes) -> str:
-    return base64.urlsafe_b64encode(b).rstrip(b"=").decode()
-
-
-def _b64url_decode(s: str) -> bytes:
-    return base64.urlsafe_b64decode(s + "=" * (-len(s) % 4))
-
-
-def _secret() -> str:
-    return settings.asr_source_secret or settings.volcano_asr_api_key or "dev-insecure-secret"
-
-
-def sign_source_token(rel_path: str, ttl: int | None = None) -> str:
-    """生成 HMAC 签名的音频下载 token：`exp.payload.sig`。
-
-    payload = base64url(相对 storage_root 的路径)；sig = HMAC-SHA256(secret, "exp.payload")。
-    无状态：api 端只需同一 secret 即可校验，不依赖 Redis/DB。
-    """
-    ttl = settings.asr_source_ttl_seconds if ttl is None else ttl
-    exp = int(time.time()) + ttl
-    payload = _b64url(rel_path.encode())
-    sig = _b64url(hmac.new(_secret().encode(), f"{exp}.{payload}".encode(), hashlib.sha256).digest())
-    return f"{exp}.{payload}.{sig}"
-
-
-def verify_source_token(token: str) -> tuple[str, bool]:
-    """校验签名与过期，返回 (rel_path, ok)。签名不符或已过期均返回 ("", False)。"""
-    parts = token.split(".")
-    if len(parts) != 3:
-        return "", False
-    exp_str, payload, sig = parts
-    expected = _b64url(hmac.new(_secret().encode(), f"{exp_str}.{payload}".encode(), hashlib.sha256).digest())
-    if not hmac.compare_digest(expected, sig):
-        return "", False
-    try:
-        if int(exp_str) < time.time():
-            return "", False
-        rel = _b64url_decode(payload).decode()
-    except Exception:  # noqa: BLE001
-        return "", False
-    return rel, True
-
-
-# ---------------- 辅助 ----------------
-
-def _is_local(url: str) -> bool:
-    host = (urlparse(url).hostname or "").lower()
-    return host in ("localhost", "127.0.0.1", "0.0.0.0", "::1", "")
-
-
-def _rel_under_storage(audio_path: str) -> str:
-    """计算相对 storage_root 的 posix 路径；不在其下则拒绝（无法生成公网链接）。"""
-    p = Path(audio_path).resolve()
-    root = settings.storage_root.resolve()
-    try:
-        return p.relative_to(root).as_posix()
-    except ValueError as exc:
-        raise ConversionError(
-            ErrorCode.ASR_FAILED, "音频不在存储目录内，无法生成公网下载链接"
-        ) from exc
+# 火山接受的容器格式：扩展名 -> 提交 format 字段
+_ACCEPTED = {".mp3": "mp3", ".wav": "wav", ".ogg": "ogg"}
+# 转码 mp3 比特率（语音 64k 足够，减小回拉体积）
+_TRANSCODE_BIN_KB = 64
 
 
 async def _ensure_accepted(audio_path: str) -> tuple[Path, str, bool]:
@@ -112,10 +45,9 @@ async def _ensure_accepted(audio_path: str) -> tuple[Path, str, bool]:
     src = Path(audio_path)
     ext = src.suffix.lower()
     if ext in _ACCEPTED:
-        return src, _ACCEPTED[ext][0], False
+        return src, _ACCEPTED[ext], False
 
-    root = settings.storage_root.resolve()
-    staged = root / "asr_tmp" / f"{uuid.uuid4().hex}.mp3"
+    staged = settings.storage_root.resolve() / "asr_tmp" / f"{uuid.uuid4().hex}.mp3"
     staged.parent.mkdir(parents=True, exist_ok=True)
     cmd = [
         settings.ffmpeg_bin, "-y", "-i", str(src), "-vn",
@@ -134,14 +66,10 @@ async def _ensure_accepted(audio_path: str) -> tuple[Path, str, bool]:
         proc.kill()
         raise ConversionError(ErrorCode.CONVERSION_TIMEOUT, "音频转码超时") from None
     if proc.returncode != 0 or not staged.exists():
-        err = ""
-        if proc.stderr:
-            err = (await proc.stderr.read()).decode(errors="replace")[:200]
+        err = (await proc.stderr.read()).decode(errors="replace")[:200] if proc.stderr else ""
         raise ConversionError(ErrorCode.CONVERSION_ENGINE_ERROR, f"音频转码失败：{err}")
     return staged, "mp3", True
 
-
-# ---------------- provider ----------------
 
 class VolcanoBigModelASRProvider(ASRProvider):
     async def transcribe(
@@ -151,19 +79,13 @@ class VolcanoBigModelASRProvider(ASRProvider):
         api_key = settings.volcano_asr_api_key
         if not api_key:
             raise ConversionError(ErrorCode.ASR_FAILED, "未配置火山 ASR（VOLCANO_ASR_API_KEY）")
-        base = (settings.public_base_url or "").rstrip("/")
-        if not base or _is_local(base):
-            raise ConversionError(
-                ErrorCode.ASR_FAILED,
-                "ASR 需要公网可达的 PUBLIC_BASE_URL（当前为本地/空，火山无法回拉音频）",
-            )
+        base = require_public_base(public_base_url=settings.public_base_url)
 
         staged: Path | None = None
         try:
             audio, fmt, is_staged = await _ensure_accepted(audio_path)
             staged = audio if is_staged else None
-            rel = _rel_under_storage(str(audio))
-            audio_url = f"{base}/api/asr-source/{sign_source_token(rel)}"
+            audio_url = f"{base}/api/asr-source/{sign_source_token(rel_under_storage(str(audio), storage_root=settings.storage_root))}"
 
             import httpx
             request_id = str(uuid.uuid4())
@@ -243,7 +165,6 @@ class VolcanoBigModelASRProvider(ASRProvider):
             )
 
     def _parse(self, r) -> tuple[str, list, float]:
-        body = {}
         try:
             body = r.json() or {}
         except Exception:  # noqa: BLE001

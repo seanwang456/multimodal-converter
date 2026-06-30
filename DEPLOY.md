@@ -48,10 +48,11 @@ docker compose up -d --wait   # 退出码 0 即全部健康
 |------|------|------|
 | `LLM_BASE_URL` | ✅ | OCR 用的 OpenAI-compatible 端点 |
 | `LLM_API_KEY` | ✅ | 对应密钥（**严禁提交进 git，注意轮换**） |
-| `LLM_VISION_MODEL` | ✅ | 视觉模型名（如 `doubao-seed-2-0-mini-260428`） |
-| `ASR_PROVIDER` | 可选 | `volcano`=豆包录音文件识别（默认 `openai`，Doubao chat 无音频转写） |
-| `VOLCANO_ASR_API_KEY` | ASR 必填 | 火山控制台 APP Key（**注意轮换**） |
-| `PUBLIC_BASE_URL` | ASR 必填 | 公网可达基址（一般填 `https://<CADDY_DOMAIN>`），火山回拉音频用 |
+| `LLM_VISION_MODEL` | ✅ | 视觉模型名（如 `qwen3.6-flash`、`doubao-seed-2-0-mini-260428`） |
+| `ASR_PROVIDER` | 可选 | ASR 后端：`aliyun`（推荐）/ `volcano` / `openai`（Whisper 兼容） |
+| `ALIYUN_ASR_MODEL` | aliyun 时 | 默认 `qwen3-asr-flash-filetrans`；key/host 留空即复用 `LLM_API_KEY`/`LLM_BASE_URL` |
+| `VOLCANO_ASR_API_KEY` | volcano 时 | 火山控制台 APP Key（**注意轮换**） |
+| `PUBLIC_BASE_URL` | aliyun/volcano 必填 | 公网可达基址（一般填 `https://<CADDY_DOMAIN>`），服务商回拉音频用；`openai` 模式不需要 |
 | `VOLCANO_ASR_RESOURCE_ID` | 可选 | `volc.bigasr.auc`（1.0，默认）/ `volc.seedasr.auc`（2.0） |
 | `CADDY_DOMAIN` | ✅ | 正式域名（留空=仅本地 localhost 无 TLS） |
 | `CORS_ORIGINS` | ✅ | 前端来源（同域经 Caddy 时可设为 `https://<域名>`） |
@@ -96,7 +97,7 @@ docker compose pull && docker compose up -d --build   # 升级版本
 
 ## 8. 已知限制（务必告知）
 
-1. **ASR（音/视频→文字）**：已接入火山豆包「录音文件识别」（`ASR_PROVIDER=volcano`）。该服务为「提交音频 URL + 轮询」模式，火山服务器从公网回拉音频，故**必须配置公网可达的 `PUBLIC_BASE_URL`**（部署时填 `https://<CADDY_DOMAIN>` 即可，`/api/asr-source/{token}` 已随 `/api/*` 被 Caddy 反代）。`PUBLIC_BASE_URL` 为空或为 `localhost` 时，音/视频转文字会返回 `ASR_FAILED`（"火山无法回拉音频"）。不支持格式（m4a/aac 等）由后端自动 ffmpeg 转 mp3 再提交。
+1. **ASR（音/视频→文字）**：支持三种后端（`ASR_PROVIDER`）：`aliyun`（阿里云千问3-ASR-Flash-Filetrans，推荐）/ `volcano`（火山豆包录音文件识别）/ `openai`（Whisper 兼容）。`aliyun` 与 `volcano` 均为「提交音频 URL + 轮询」模式，服务商从公网回拉音频，故**必须配置公网可达的 `PUBLIC_BASE_URL`**（部署时填 `https://<CADDY_DOMAIN>` 即可，`/api/asr-source/{token}` 已随 `/api/*` 被 Caddy 反代）；`openai` 模式直接上传字节，不需要。`PUBLIC_BASE_URL` 为空或为 `localhost` 时，回拉类 ASR 会返回 `ASR_FAILED`。注意：key 所在账号需在服务商控制台为对应模型开通授权，否则返回 `access_denied`。
 2. **并发**：默认 4（`MAX_CONCURRENT_JOBS`）。LibreOffice 并发较高时可能不稳定，重 office 负载建议设为 2。
 3. **单机部署**：1 worker + SQLite。要多副本横向扩展需迁移到 PostgreSQL + 多 worker（代码已抽象 JobRunner/Storage，可平滑迁移）。
 4. **无限流 / 无队列上限**：公网暴露建议在 Caddy 前再加一层限流（或 WAF）。

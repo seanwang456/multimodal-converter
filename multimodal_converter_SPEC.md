@@ -20,7 +20,7 @@
 - 音频格式互转矩阵
 - 视频转文本规则与注意事项
 
-本 SPEC 将其整理为适合 vibe coding / agent coding 的开发说明。
+本 SPEC 为该产品的需求规格说明（功能范围、约束、验收标准），作为产品与交付的事实来源。
 
 ---
 
@@ -1411,44 +1411,6 @@ services:
 ```
 
 MVP 可以先不用 worker，但代码结构要能迁移。
-
----
-
-## 27. 给 Coding Agent 的启动提示词
-
-```text
-你是资深 full-stack engineer。请基于 docs/SPEC.md 开发一个多模态文件转换 Web 应用。
-
-技术栈：
-- 前端：Next.js + React + TypeScript + Tailwind + shadcn/ui
-- 后端：FastAPI + Python
-- 存储：MVP 使用本地 storage 目录
-- 任务：MVP 可先用 BackgroundTasks，但代码结构要能后续替换为 Redis/RQ 或 Celery
-- 转换：必须实现真实文件转换，不允许 mock download，不允许 fake result
-
-开发要求：
-1. 先实现项目骨架、上传、conversion registry、任务创建、状态轮询、下载。
-2. 后端 registry 是最终校验源，前端 registry 只能用于展示。
-3. 每个转换 handler 必须走统一接口。
-4. 所有上传文件必须校验扩展名、MIME type、大小限制。
-5. 每个 job 使用独立 workdir。
-6. 转换失败必须返回结构化 error code 和用户可读 message。
-7. 首轮至少完成以下真实转换：
-   - txt -> docx
-   - txt -> pdf
-   - txt -> pptx
-   - txt -> xlsx
-   - jpg/png/bmp 互转
-   - mp3/wav/m4a/aac 互转
-   - docx/pptx/xlsx -> pdf
-   - docx/pptx/xlsx -> txt
-   - xlsx -> csv
-8. 第二轮接入 OCR/ASR Provider，实现图片/音频/视频转文本类文档。
-9. 给出 README，包含启动方式、环境变量、测试样本说明。
-10. 写自动化测试，至少覆盖 registry 校验、文件大小校验、不支持转换拒绝、真实转换输出文件存在且可打开。
-
-请先生成实施计划，然后按 Phase 1 → Phase 2 → Phase 3 → Phase 4 的顺序开发。每完成一个 phase，运行测试并输出验收结果。
-```
 
 ---
 

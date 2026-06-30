@@ -60,6 +60,11 @@ class Settings:
     asr_query_timeout_seconds: int = _get_int("ASR_QUERY_TIMEOUT_SECONDS", 1080)
     asr_query_interval_seconds: int = _get_int("ASR_QUERY_INTERVAL_SECONDS", 5)
 
+    # 阿里云百炼「千问3-ASR-Flash-Filetrans」（DashScope 异步录音文件识别）
+    aliyun_asr_model: str = os.getenv("ALIYUN_ASR_MODEL", "qwen3-asr-flash-filetrans")
+    aliyun_asr_base_url: str = os.getenv("ALIYUN_ASR_BASE_URL", "")  # 空=从 LLM_BASE_URL 推导主机
+    aliyun_asr_api_key: str = os.getenv("ALIYUN_ASR_API_KEY", "")    # 空=复用 LLM_API_KEY
+
     # 文件大小上限（MB）—— 规格 §6
     max_image_mb: int = _get_int("MAX_IMAGE_MB", 20)
     max_pdf_mb: int = _get_int("MAX_PDF_MB", 50)

@@ -43,14 +43,26 @@ docker compose up -d --wait      # 退出码 0 = 全部健康
 | `CADDY_DOMAIN` | 正式域名，驱动自动 HTTPS（留空=仅本地反代） |
 | `CORS_ORIGINS` | 前端来源，一般填 `https://<域名>` |
 | `LLM_BASE_URL` / `LLM_API_KEY` | OCR 用的 OpenAI 兼容端点与密钥 |
-| `LLM_VISION_MODEL` | 视觉模型名（如 `doubao-seed-2-0-mini-260428`） |
-| `ASR_PROVIDER` | ASR 后端：`volcano`（火山）或 `openai`（Whisper 兼容） |
-| `VOLCANO_ASR_API_KEY` | 火山语音 APP Key（`ASR_PROVIDER=volcano` 时必填） |
-| `PUBLIC_BASE_URL` | 火山 ASR 回拉音频的公网地址（=域名，火山模式必填） |
+| `LLM_VISION_MODEL` | 视觉模型名（如 `qwen3.6-flash`、`qwen-vl-ocr`、`doubao-seed-2-0-mini-260428`） |
+| `ASR_PROVIDER` | ASR 后端：`aliyun`（推荐）/ `volcano` / `openai` |
+| `PUBLIC_BASE_URL` | aliyun/volcano 回拉音频的公网地址（=域名，这两种模式必填） |
 
-**更换服务商**：OCR 与 Whisper 兼容 ASR 仅改 `LLM_*` / `ASR_PROVIDER` 即可；私有协议 ASR 新增一个 provider 文件即可（见 `apps/api/app/providers/`）。
+不同 ASR 服务商的额外变量：`aliyun` → `ALIYUN_ASR_*`（key 默认复用 `LLM_API_KEY`）；`volcano` → `VOLCANO_ASR_*`；`openai` → `LLM_ASR_MODEL`（Whisper 兼容，无需 `PUBLIC_BASE_URL`）。完整清单见 `.env.example`。
 
 > ⚠️ `.env` 含密钥，已被 `.gitignore` 忽略，**切勿提交**；正式环境请使用公司自己的 key。
+
+### 运维配置 Key 流程
+
+1. **拿一个 OpenAI 兼容的视觉端点**（用于图片 OCR）：填 `LLM_BASE_URL` + `LLM_API_KEY` + `LLM_VISION_MODEL`。
+   - 阿里云百炼：`LLM_BASE_URL=https://<工作空间ID>.cn-beijing.maas.aliyuncs.com/compatible-mode/v1`，视觉模型如 `qwen3.6-flash`。
+   - 火山方舟：`https://ark.cn-beijing.volces.com/api/v3`，`doubao-seed-2-0-mini-260428`。
+2. **选 ASR 服务商**，设 `ASR_PROVIDER`：
+   - `aliyun`（推荐）：`ALIYUN_ASR_MODEL=qwen3-asr-flash-filetrans`，key 留空即复用 `LLM_API_KEY`；主机留空自动从 `LLM_BASE_URL` 推导。
+   - `volcano`：填 `VOLCANO_ASR_API_KEY` + `VOLCANO_ASR_RESOURCE_ID=volc.bigasr.auc`。
+   - `openai`（Whisper 兼容）：填 `LLM_ASR_MODEL`，复用 `LLM_BASE_URL/KEY`。
+3. **aliyun / volcano 模式**还需 `PUBLIC_BASE_URL=https://<CADDY_DOMAIN>`（服务商从公网回拉音频）。`openai` 模式不需要。
+4. **开通模型权限**：key 所在账号需在服务商控制台为对应模型（视觉模型、ASR 模型）开通授权/额度，否则会返回 `access_denied`。
+5. 改完 `.env` 后 `docker compose up -d`（或 `restart api worker`）生效。
 
 ## 本地开发
 

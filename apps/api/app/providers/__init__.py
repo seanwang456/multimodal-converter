@@ -23,10 +23,15 @@ def get_ocr_provider() -> OCRProvider:
 def get_asr_provider() -> ASRProvider:
     global _asr
     if _asr is None:
-        if (settings.asr_provider or "openai").lower() == "volcano":
+        mode = (settings.asr_provider or "openai").lower()
+        if mode == "volcano":
             from app.providers.volcano_asr import VolcanoBigModelASRProvider
 
             _asr = VolcanoBigModelASRProvider()
+        elif mode == "aliyun":
+            from app.providers.aliyun_asr import AliyunFiletransASRProvider
+
+            _asr = AliyunFiletransASRProvider()
         else:
             from app.providers.llm_provider import OpenAIASRProvider
 

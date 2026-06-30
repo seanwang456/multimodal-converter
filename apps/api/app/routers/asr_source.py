@@ -10,7 +10,7 @@ from fastapi import APIRouter
 from fastapi.responses import FileResponse
 
 from app.errors import ConversionError, ErrorCode
-from app.providers.volcano_asr import verify_source_token
+from app.providers.asr_source import verify_source_token
 from app.services.storage import _safe_join  # 复用 storage_root 路径穿越防护
 
 router = APIRouter(prefix="/api/asr-source", tags=["asr-source"])

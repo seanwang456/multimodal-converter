@@ -100,9 +100,9 @@ def test_token_expired(monkeypatch, tmp_path):
 # ---------------- _is_local ----------------
 
 def test_is_local():
-    assert v._is_local("http://localhost:8000")
-    assert v._is_local("http://127.0.0.1:8000")
-    assert not v._is_local("https://convert.example.com")
+    assert v.is_local_url("http://localhost:8000")
+    assert v.is_local_url("http://127.0.0.1:8000")
+    assert not v.is_local_url("https://convert.example.com")
 
 
 # ---------------- _parse ----------------
@@ -263,7 +263,7 @@ def test_asr_source_endpoint_bad_token(client):
 
 def test_asr_source_endpoint_traversal_rejected(client):
     # 签名一个越界路径（手动用同 secret 构造）应被 _safe_join 拦截
-    from app.providers.volcano_asr import _b64url, _secret
+    from app.providers.asr_source import _b64url, _secret
     import hmac, hashlib, base64
     payload = _b64url(b"../../etc/passwd")
     exp = str(int(time.time()) + 60)
