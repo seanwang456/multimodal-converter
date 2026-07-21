@@ -6,6 +6,7 @@
 ## 功能
 
 - **办公文档互转**：Word / Excel / PPT / PDF 之间互转（`.docx/.xlsx/.pptx/.pdf`；旧版 `.doc/.ppt/.xls` → `.pdf`）
+- **扫描 PDF**：文字型、扫描型及混合 PDF → 可编辑 TXT / Word；扫描页自动使用 OCR Provider
 - **图片**：`jpg/png/bmp` 互转；图片 OCR → 文字 / Word / PDF
 - **音频**：`mp3/wav/m4a/aac` 互转；音频转文字（ASR）→ 文字 / Word / PDF
 - **视频**：`mp4` → 文字 / Word / PDF（识别音轨，不含画面 OCR）
@@ -46,6 +47,9 @@ docker compose up -d --wait      # 退出码 0 = 全部健康
 | `LLM_VISION_MODEL` | 视觉模型名（如 `qwen3.6-flash`、`qwen-vl-ocr`、`doubao-seed-2-0-mini-260428`） |
 | `ASR_PROVIDER` | ASR 后端：`aliyun`（推荐）/ `volcano` / `openai` |
 | `PUBLIC_BASE_URL` | aliyun/volcano 回拉音频的公网地址（=域名，这两种模式必填） |
+
+PDF 页面没有可用文本层时会自动转为图片并调用 OCR。此时必须配置
+`LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_VISION_MODEL`；普通文字型 PDF 不调用 OCR。
 
 不同 ASR 服务商的额外变量：`aliyun` → `ALIYUN_ASR_*`（key 默认复用 `LLM_API_KEY`）；`volcano` → `VOLCANO_ASR_*`；`openai` → `LLM_ASR_MODEL`（Whisper 兼容，无需 `PUBLIC_BASE_URL`）。完整清单见 `.env.example`。
 
