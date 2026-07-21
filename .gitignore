@@ -17,6 +17,7 @@ CLAUDE.md
 .DS_Store
 .idea/
 .vscode/
+.worktrees/
 *.log
 
 # omc / Claude 工具运行时状态（会被插件自动重建）
