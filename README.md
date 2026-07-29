@@ -47,9 +47,11 @@ docker compose up -d --wait      # 退出码 0 = 全部健康
 | `LLM_VISION_MODEL` | 视觉模型名（如 `qwen3.6-flash`、`qwen-vl-ocr`、`doubao-seed-2-0-mini-260428`） |
 | `ASR_PROVIDER` | ASR 后端：`aliyun`（推荐）/ `volcano` / `openai` |
 | `PUBLIC_BASE_URL` | aliyun/volcano 回拉音频的公网地址（=域名，这两种模式必填） |
+| `PDF_OCR_PAGE_CONCURRENCY` | 单份扫描 PDF 的页级 OCR 并发，范围 1–8，默认 3 |
 
 PDF 页面没有可用文本层时会自动转为图片并调用 OCR。此时必须配置
 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_VISION_MODEL`；普通文字型 PDF 不调用 OCR。
+扫描页默认每份 PDF 同时识别 3 页，可通过 `PDF_OCR_PAGE_CONCURRENCY` 调整。该值会与 `MAX_CONCURRENT_JOBS` 相乘；默认单 worker 理论峰值为 12 个 PDF OCR 请求。模型限流或内存紧张时可降为 1–2。
 
 不同 ASR 服务商的额外变量：`aliyun` → `ALIYUN_ASR_*`（key 默认复用 `LLM_API_KEY`）；`volcano` → `VOLCANO_ASR_*`；`openai` → `LLM_ASR_MODEL`（Whisper 兼容，无需 `PUBLIC_BASE_URL`）。完整清单见 `.env.example`。
 
