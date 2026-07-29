@@ -9,14 +9,35 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.config import settings
 from app.errors import ConversionError, ErrorCode
 from app.handlers.base import ConversionHandler, ConversionResult
 from app.handlers.docgen import write_docx, write_pptx
+from app.providers import get_ocr_provider
 
 PDF_TARGETS = {".txt", ".docx", ".pptx", ".xlsx"}
+OCR_QUALITY_NOTICE = "扫描页面经 OCR 识别，复杂版面、手写内容或低清晰度页面可能存在误差。"
+_PDFIUM_RENDER_LOCK = threading.Lock()
+
+log = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class PdfPageState:
+    index: int
+    native_text: str
+    needs_ocr: bool
+
+
+@dataclass(frozen=True)
+class PdfTextResult:
+    text: str
+    ocr_pages: int
 
 
 def _is_password_error(e: Exception) -> bool:
@@ -42,6 +63,160 @@ def _extract_pdf_text(input_path: str) -> str:
         for page in pdf.pages:
             parts.append(page.extract_text() or "")
     return "\n\n".join(parts).strip()
+
+
+def _has_page_sized_image(page) -> bool:  # noqa: ANN001
+    """页面存在覆盖至少一半版面的图片时，视为可能包含扫描正文。"""
+    page_area = float(page.width * page.height)
+    if page_area <= 0:
+        return False
+    for image in page.images:
+        try:
+            width = max(0.0, float(image.get("x1", 0)) - float(image.get("x0", 0)))
+            height = max(0.0, float(image.get("bottom", 0)) - float(image.get("top", 0)))
+        except (TypeError, ValueError):
+            continue
+        if width * height / page_area >= 0.5:
+            return True
+    return False
+
+
+def _page_needs_ocr(page, text: str) -> bool:  # noqa: ANN001
+    """无文本层，或仅有少量文字叠在整页图片上时触发 OCR。"""
+    compact = "".join(text.split())
+    return not compact or (len(compact) < 20 and _has_page_sized_image(page))
+
+
+def _inspect_pdf_pages(input_path: str) -> list[PdfPageState]:
+    """一次读取每页原生文本并判定是否需要 OCR。"""
+    import pdfplumber
+
+    states: list[PdfPageState] = []
+    with pdfplumber.open(input_path) as pdf:
+        for index, page in enumerate(pdf.pages):
+            text = page.extract_text() or ""
+            states.append(
+                PdfPageState(
+                    index=index,
+                    native_text=text,
+                    needs_ocr=_page_needs_ocr(page, text),
+                )
+            )
+    return states
+
+
+def _render_pdf_page(input_path: str, page_index: int, dest: Path) -> None:
+    """将单页渲染为 OCR Provider 可读的 PNG。"""
+    import pdfplumber
+
+    with _PDFIUM_RENDER_LOCK:
+        with pdfplumber.open(input_path) as pdf:
+            page_image = pdf.pages[page_index].to_image(resolution=250, antialias=True)
+            page_image.save(str(dest), format="PNG")
+
+
+async def _render_pdf_page_for_ocr(
+    input_path: str,
+    page_index: int,
+    dest: Path,
+) -> None:
+    render_task = asyncio.create_task(
+        asyncio.to_thread(_render_pdf_page, input_path, page_index, dest),
+    )
+    try:
+        await asyncio.shield(render_task)
+    except asyncio.CancelledError:
+        try:
+            await render_task
+        except Exception:  # cancellation remains the externally visible result
+            pass
+        raise
+
+
+async def _extract_pdf_text_with_ocr(
+    input_path: str,
+    output_dir: Path,
+    options: dict[str, Any],
+    pages: list[PdfPageState] | None = None,
+) -> PdfTextResult:
+    """按页合并原生文本与 OCR 文本，并及时清理渲染图片。"""
+    states = pages if pages is not None else await asyncio.to_thread(
+        _inspect_pdf_pages, input_path,
+    )
+    ocr_states = [state for state in states if state.needs_ocr]
+    provider = get_ocr_provider() if ocr_states else None
+    parts = [
+        state.native_text.strip() if not state.needs_ocr else ""
+        for state in states
+    ]
+
+    if not ocr_states:
+        return PdfTextResult(text="\n\n".join(parts).strip(), ocr_pages=0)
+    if provider is None:
+        raise ConversionError(ErrorCode.OCR_FAILED, "OCR Provider 不可用")
+
+    worker_count = min(settings.pdf_ocr_page_concurrency, len(ocr_states))
+    next_position = 0
+    stop = asyncio.Event()
+    errors: list[tuple[int, Exception]] = []
+    log.info(
+        "PDF OCR 启动：扫描页 %d，页级并发 %d",
+        len(ocr_states),
+        worker_count,
+    )
+
+    async def worker() -> None:
+        nonlocal next_position
+        while not stop.is_set() and next_position < len(ocr_states):
+            state = ocr_states[next_position]
+            next_position += 1
+            image_path = output_dir / f"ocr-page-{state.index + 1}.png"
+            try:
+                try:
+                    await _render_pdf_page_for_ocr(
+                        input_path, state.index, image_path,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    raise ConversionError(
+                        ErrorCode.CONVERSION_ENGINE_ERROR,
+                        "PDF 页面渲染失败",
+                    ) from exc
+                result = await provider.extract_text(
+                    str(image_path),
+                    language=options.get("ocr_language", "auto"),
+                    detect_tables=options.get("detect_tables", True),
+                    preserve_layout=options.get("preserve_layout", False),
+                )
+                parts[state.index] = (result.get("text") or "").strip()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors.append((state.index, exc))
+                stop.set()
+            finally:
+                image_path.unlink(missing_ok=True)
+
+    async with asyncio.TaskGroup() as group:
+        for _ in range(worker_count):
+            group.create_task(worker())
+
+    if errors:
+        errors.sort(key=lambda item: item[0])
+        raise errors[0][1]
+
+    return PdfTextResult(
+        text="\n\n".join(parts).strip(),
+        ocr_pages=len(ocr_states),
+    )
+
+
+def _ocr_quality_notice(result: PdfTextResult) -> str:
+    notice = OCR_QUALITY_NOTICE
+    if not result.text:
+        notice += " 未识别到有效文字。"
+    return notice
 
 
 def _pdf_to_docx_layout(input_path: str, out: Path) -> None:
@@ -130,9 +305,33 @@ class PdfHandler(ConversionHandler):
                 quality_notice="PDF 表格为结构化识别，无框线表格可能存在列错位。",
             )
 
-        # PDF → DOCX：优先 pdf2docx 保留版式，失败回退纯文本
+        pages: list[PdfPageState] | None = None
+        if target_ext in {".txt", ".docx"}:
+            try:
+                pages = await asyncio.to_thread(_inspect_pdf_pages, input_path)
+            except Exception as e:
+                if _is_password_error(e):
+                    raise ConversionError(
+                        ErrorCode.PASSWORD_PROTECTED_PDF,
+                        "PDF 已加密，请解除密码后重新上传",
+                    ) from e
+                raise ConversionError(
+                    ErrorCode.CONVERSION_ENGINE_ERROR, "PDF 文本提取失败",
+                ) from e
+
+        # PDF → DOCX：扫描页走 OCR 生成可编辑文字；纯文字 PDF 保留版式转换路径
         if target_ext == ".docx":
             out = out_dir / "result.docx"
+            assert pages is not None
+            if any(page.needs_ocr for page in pages):
+                extracted = await _extract_pdf_text_with_ocr(
+                    input_path, out_dir, options, pages,
+                )
+                await asyncio.to_thread(write_docx, extracted.text, out)
+                return ConversionResult(
+                    output_path=str(out), filename=out.name, size_bytes=out.stat().st_size,
+                    quality_notice=_ocr_quality_notice(extracted),
+                )
             try:
                 await asyncio.to_thread(_pdf_to_docx_layout, input_path, out)
                 return ConversionResult(
@@ -145,14 +344,31 @@ class PdfHandler(ConversionHandler):
                 if _is_password_error(e):
                     raise ConversionError(ErrorCode.PASSWORD_PROTECTED_PDF, "PDF 已加密，请解除密码后重新上传") from e
                 # 版式转换失败 → 回退纯文本 docx（不放弃转换）
-                text = await asyncio.to_thread(_extract_pdf_text_safe, input_path)
+                text = "\n\n".join(page.native_text for page in pages).strip()
                 await asyncio.to_thread(write_docx, text, out)
                 return ConversionResult(
                     output_path=str(out), filename=out.name, size_bytes=out.stat().st_size,
                     quality_notice="版式还原失败，已退化为纯文本 Word。",
                 )
 
-        # txt/pptx：提取纯文本
+        # PDF → TXT：原生文本页直接提取，扫描页按需 OCR
+        if target_ext == ".txt":
+            assert pages is not None
+            extracted = await _extract_pdf_text_with_ocr(
+                input_path, out_dir, options, pages,
+            )
+            out = out_dir / "result.txt"
+            await asyncio.to_thread(out.write_text, extracted.text, "utf-8")
+            return ConversionResult(
+                output_path=str(out), filename=out.name, size_bytes=out.stat().st_size,
+                quality_notice=(
+                    _ocr_quality_notice(extracted)
+                    if extracted.ocr_pages
+                    else "PDF 转 TXT 仅保留纯文本，丢弃排版和图片。"
+                ),
+            )
+
+        # PPTX：保持现有原生文本提取行为，本次不扩展扫描页 OCR
         try:
             text = await asyncio.to_thread(_extract_pdf_text, input_path)
         except Exception as e:
@@ -161,22 +377,12 @@ class PdfHandler(ConversionHandler):
             raise ConversionError(ErrorCode.CONVERSION_ENGINE_ERROR, "PDF 文本提取失败") from e
 
         out = out_dir / f"result{target_ext}"
-        if target_ext == ".txt":
-            await asyncio.to_thread(out.write_text, text, "utf-8")
-        elif target_ext == ".pptx":
+        if target_ext == ".pptx":
             await asyncio.to_thread(write_pptx, text, out)
         return ConversionResult(
             output_path=str(out), filename=out.name, size_bytes=out.stat().st_size,
             quality_notice="PDF 转文档为 best-effort，复杂排版可能无法完全还原。",
         )
-
-
-def _extract_pdf_text_safe(input_path: str) -> str:
-    """docx 回退路径用的文本提取；任何异常都吞掉返回已有文本（外层已 preflight 加密）。"""
-    try:
-        return _extract_pdf_text(input_path)
-    except Exception:  # noqa: BLE001
-        return ""
 
 
 PDF_HANDLERS: dict[str, ConversionHandler] = {
