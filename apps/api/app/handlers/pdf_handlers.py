@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import threading
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -21,6 +22,7 @@ from app.providers import get_ocr_provider
 
 PDF_TARGETS = {".txt", ".docx", ".pptx", ".xlsx"}
 OCR_QUALITY_NOTICE = "扫描页面经 OCR 识别，复杂版面、手写内容或低清晰度页面可能存在误差。"
+_PDFIUM_RENDER_LOCK = threading.Lock()
 
 log = logging.getLogger(__name__)
 
@@ -107,9 +109,10 @@ def _render_pdf_page(input_path: str, page_index: int, dest: Path) -> None:
     """将单页渲染为 OCR Provider 可读的 PNG。"""
     import pdfplumber
 
-    with pdfplumber.open(input_path) as pdf:
-        page_image = pdf.pages[page_index].to_image(resolution=250, antialias=True)
-        page_image.save(str(dest), format="PNG")
+    with _PDFIUM_RENDER_LOCK:
+        with pdfplumber.open(input_path) as pdf:
+            page_image = pdf.pages[page_index].to_image(resolution=250, antialias=True)
+            page_image.save(str(dest), format="PNG")
 
 
 async def _render_pdf_page_for_ocr(

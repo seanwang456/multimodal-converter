@@ -2,6 +2,9 @@
 from __future__ import annotations
 
 import asyncio
+import subprocess
+import sys
+import textwrap
 import threading
 from pathlib import Path
 from types import SimpleNamespace
@@ -175,6 +178,50 @@ def _make_mixed_pdf(path: Path) -> Path:
     pdf.drawImage(ImageReader(str(scan_image)), 0, 0, width=width, height=height)
     pdf.save()
     return path
+
+
+def test_pdfium_rendering_is_serialized_across_page_threads(
+    tmp_path: Path,
+) -> None:
+    src = _make_multi_page_scanned_pdf(tmp_path / "render-lock.pdf")
+    script = textwrap.dedent(
+        """
+        import asyncio
+        import sys
+        from pathlib import Path
+
+        from app.handlers.pdf_handlers import _render_pdf_page
+
+        async def main() -> None:
+            source = sys.argv[1]
+            output_dir = Path(sys.argv[2])
+            await asyncio.gather(*(
+                asyncio.to_thread(
+                    _render_pdf_page,
+                    source,
+                    page_index,
+                    output_dir / f"subprocess-page-{page_index + 1}.png",
+                )
+                for page_index in range(3)
+            ))
+
+        asyncio.run(main())
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script, str(src), str(tmp_path)],
+        cwd=Path(__file__).parents[1],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    rendered = sorted(tmp_path.glob("subprocess-page-*.png"))
+    assert len(rendered) == 3
+    assert all(path.stat().st_size > 0 for path in rendered)
 
 
 def test_scanned_pdf_to_txt_uses_ocr_and_forwards_options(
@@ -392,7 +439,7 @@ def test_multi_page_scanned_pdf_to_docx_keeps_page_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = CoordinatedOCR(delays={1: 0.08, 2: 0.04, 3: 0.01})
+    provider = CoordinatedOCR(wait_for_started=3)
     monkeypatch.setattr(providers, "_ocr", provider)
     monkeypatch.setattr(
         pdf_handlers,
@@ -408,5 +455,5 @@ def test_multi_page_scanned_pdf_to_docx_keeps_page_order(
     text = "\n".join(p.text for p in Document(result["output_path"]).paragraphs)
     assert text.index("OCR PAGE 1") < text.index("OCR PAGE 2")
     assert text.index("OCR PAGE 2") < text.index("OCR PAGE 3")
-    assert provider.max_active >= 2
+    assert provider.max_active == 3
     assert not list(out_dir.glob("ocr-page-*.png"))

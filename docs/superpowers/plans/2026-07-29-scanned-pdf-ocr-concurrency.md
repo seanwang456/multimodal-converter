@@ -2,11 +2,11 @@
 
 > **For agentic workers:** REQUIRED SUB-SKILL: Use superpowers:subagent-driven-development (recommended) or superpowers:executing-plans to implement this plan task-by-task. Steps use checkbox (`- [ ]`) syntax for tracking.
 
-**Goal:** Replace sequential scanned-page OCR with an ordered, bounded page worker pool whose deployment default is 3 concurrent pages per PDF.
+**Goal:** Replace sequential scanned-page Provider calls with an ordered, bounded page worker pool whose deployment default is 3 concurrent OCR requests per PDF, while keeping PDFium rendering process-globally serialized.
 
-**Architecture:** Keep page detection, the `OCRProvider` interface, and output handlers unchanged. Add a bounded configuration value and a PDF-local async worker pool that renders and recognizes only scanned pages, stores results by original page index, stops assigning new work after a failure, and waits for in-flight render threads before cleanup.
+**Architecture:** Keep page detection, the `OCRProvider` interface, and output handlers unchanged. Add a bounded configuration value and a PDF-local async worker pool that recognizes only scanned pages, stores results by original page index, stops assigning new work after a failure, and waits for in-flight render threads before cleanup. Every PDFium-backed `_render_pdf_page` call is protected by one process-level mutex because PDFium is globally not thread-safe; the mutex ends before `OCRProvider.extract_text(...)`, so Provider requests retain PDF-local bounded concurrency.
 
-**Tech Stack:** Python 3.11, asyncio `TaskGroup`, FastAPI settings, pdfplumber, existing `OCRProvider`, pytest, Docker Compose.
+**Tech Stack:** Python 3.11, asyncio `TaskGroup`, `threading.Lock`, FastAPI settings, pdfplumber/pypdfium2, existing `OCRProvider`, pytest, Docker Compose.
 
 ## Global Constraints
 
@@ -14,11 +14,13 @@
 - The concurrency setting is deployment-only and must not be accepted from job options.
 - Native-text pages must never be sent to OCR, and output must remain in original PDF page order.
 - PDF → TXT and scanned PDF → DOCX share the concurrent extractor; pure-text PDF → DOCX remains on `pdf2docx`.
+- `PDF_OCR_PAGE_CONCURRENCY` controls PDF-local OCR worker/Provider concurrency, not PDFium render concurrency.
+- All PDFium-backed `_render_pdf_page` calls in one process are globally serialized; the render mutex must not cover `OCRProvider.extract_text(...)`.
 - A page render error remains `CONVERSION_ENGINE_ERROR`; Provider errors such as `OCR_FAILED` retain their existing structured code.
 - After one page fails, workers stop claiming new pages but allow already-started render/OCR work to finish and clean up.
 - Render runs at the existing 250 DPI, and every `ocr-page-*.png` is removed on success, failure, or cancellation.
 - The existing 20-minute PDF job timeout, Registry, routes, job schema, and frontend behavior do not change.
-- Do not add Provider retries, multi-image prompts, global cross-job limiting, or XLSX/PPTX OCR.
+- Do not add Provider retries, multi-image prompts, global cross-job OCR/Provider limiting, or XLSX/PPTX OCR. The process-global PDFium render mutex is a required safety boundary and is not an OCR limiter.
 - Never log page contents, image bytes, credentials, or absolute server paths.
 
 ---
@@ -135,30 +137,38 @@ git commit -m "feat: add bounded PDF OCR page concurrency setting"
 
 **Interfaces:**
 - Consumes: `settings.pdf_ocr_page_concurrency`, `PdfPageState`, `_render_pdf_page(...)`, and `OCRProvider.extract_text(...)`.
-- Produces: `_render_pdf_page_for_ocr(input_path: str, page_index: int, dest: Path) -> None` as an async cancellation-safe adapter and concurrent behavior inside `_extract_pdf_text_with_ocr(...) -> PdfTextResult`.
+- Produces: process-safe serialized PDFium rendering inside `_render_pdf_page(...)`, `_render_pdf_page_for_ocr(input_path: str, page_index: int, dest: Path) -> None` as an async cancellation-safe adapter, and PDF-local concurrent Provider behavior inside `_extract_pdf_text_with_ocr(...) -> PdfTextResult`.
+
+**Approved safety correction:** Root-cause testing showed that pypdfium2/PDFium crashes when called concurrently from different threads, including calls for different PDF files. Add an isolated subprocess regression that concurrently invokes the real production `_render_pdf_page`; it must exit 0 and produce three non-empty PNGs. Protect all PDFium render calls with a clearly named process-level `threading.Lock`. Do not add a global OCR/Provider limiter.
 
 - [ ] **Step 1: Add a controllable fake Provider and fake renderer**
 
 Extend `apps/api/tests/test_pdf_ocr.py` imports:
 
 ```python
+import subprocess
+import sys
+import textwrap
 import threading
 from types import SimpleNamespace
 
 import app.handlers.pdf_handlers as pdf_handlers
 ```
 
-Add a Provider that records overlap, page order, and optional failure. The page number is derived from the existing `ocr-page-{number}.png` filename.
+Add a Provider that records overlap, page order, optional failure, and an optional start barrier. The page number is derived from the existing `ocr-page-{number}.png` filename. The barrier lets the real-render integration test prove Provider concurrency deterministically even though rendering is serialized.
 
 ```python
 class CoordinatedOCR(OCRProvider):
     def __init__(
         self,
         delays: dict[int, float] | None = None,
-        fail_page: int | None = None,
+        fail_pages: set[int] | None = None,
+        wait_for_started: int | None = None,
     ) -> None:
         self.delays = delays or {}
-        self.fail_page = fail_page
+        self.fail_pages = fail_pages or set()
+        self.wait_for_started = wait_for_started
+        self._started_barrier = asyncio.Event()
         self.started: list[int] = []
         self.active = 0
         self.max_active = 0
@@ -175,8 +185,15 @@ class CoordinatedOCR(OCRProvider):
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
+            if (
+                self.wait_for_started is not None
+                and len(self.started) >= self.wait_for_started
+            ):
+                self._started_barrier.set()
+            if self.wait_for_started is not None:
+                await self._started_barrier.wait()
             await asyncio.sleep(self.delays.get(page_number, 0.03))
-            if page_number == self.fail_page:
+            if page_number in self.fail_pages:
                 raise ConversionError(ErrorCode.OCR_FAILED, f"第 {page_number} 页 OCR 失败")
             return OCRResult(
                 text=f"OCR PAGE {page_number}", tables=[], confidence=0.9,
@@ -197,6 +214,12 @@ def _ocr_states(count: int) -> list[pdf_handlers.PdfPageState]:
         for index in range(count)
     ]
 ```
+
+- [ ] **Step 1a: Write the isolated subprocess PDFium safety regression**
+
+Create a real three-page image-only PDF in the parent pytest process. Launch `sys.executable -c ...` with `cwd=apps/api`; inside the child, concurrently call the production `_render_pdf_page` through three `asyncio.to_thread` calls. Assert child exit code `0`, exactly three output PNGs, and every PNG size greater than zero. Before the process-level mutex exists, the isolated child must terminate with a native signal/non-zero exit without taking down pytest itself.
+
+This regression exercises the real pdfplumber/pypdfium2 renderer. Do not monkeypatch the renderer or assert on the lock object.
 
 - [ ] **Step 2: Write failing concurrency and order tests**
 
@@ -242,7 +265,7 @@ def test_pdf_ocr_failure_stops_new_pages_and_cleans_inflight_images(
 ) -> None:
     provider = CoordinatedOCR(
         delays={1: 0.08, 2: 0.01, 3: 0.08},
-        fail_page=2,
+        fail_pages={2},
     )
     monkeypatch.setattr(providers, "_ocr", provider)
     monkeypatch.setattr(pdf_handlers, "_render_pdf_page", _fake_render_pdf_page)
@@ -323,16 +346,33 @@ cd apps/api
 uv run pytest tests/test_pdf_ocr.py -q
 ```
 
-Expected: the existing implementation fails the concurrency assertions because `provider.max_active` remains 1, and it continues processing pages after a failure model that expects a bounded work pool.
+Expected: the isolated PDFium subprocess test exits non-zero due to the native threading violation. The existing sequential extractor also fails the concurrency assertions because `provider.max_active` remains 1, and it continues processing pages after a failure model that expects a bounded work pool.
 
 - [ ] **Step 6: Add cancellation-safe threaded rendering**
 
-Import the shared settings object and create a module logger in `apps/api/app/handlers/pdf_handlers.py`:
+Import the shared settings object and threading support, create the process-level PDFium mutex, and create a module logger in `apps/api/app/handlers/pdf_handlers.py`:
 
 ```python
+import threading
+
 from app.config import settings
 
+_PDFIUM_RENDER_LOCK = threading.Lock()
 log = logging.getLogger(__name__)
+```
+
+Protect the complete PDFium-backed render operation. The lock is process-global and intentionally covers calls from different jobs and different PDFs, because PDFium is globally not thread-safe:
+
+```python
+def _render_pdf_page(input_path: str, page_index: int, dest: Path) -> None:
+    import pdfplumber
+
+    with _PDFIUM_RENDER_LOCK:
+        with pdfplumber.open(input_path) as pdf:
+            page_image = pdf.pages[page_index].to_image(
+                resolution=250, antialias=True,
+            )
+            page_image.save(str(dest), format="PNG")
 ```
 
 Add this adapter immediately after `_render_pdf_page`:
@@ -356,7 +396,7 @@ async def _render_pdf_page_for_ocr(
         raise
 ```
 
-The shield prevents cancellation from cancelling the asyncio wrapper while the underlying thread keeps running. Waiting for `render_task` before propagating cancellation makes the later `unlink` safe.
+The shield prevents cancellation from cancelling the asyncio wrapper while the underlying thread keeps running or waits for `_PDFIUM_RENDER_LOCK`. Waiting for `render_task` before propagating cancellation makes the later `unlink` safe. `_PDFIUM_RENDER_LOCK` is released before `provider.extract_text(...)`, so this safety correction does not serialize Provider requests.
 
 - [ ] **Step 7: Replace the sequential loop with the bounded worker pool**
 
@@ -468,7 +508,7 @@ def test_multi_page_scanned_pdf_to_docx_keeps_page_order(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
-    provider = CoordinatedOCR(delays={1: 0.08, 2: 0.04, 3: 0.01})
+    provider = CoordinatedOCR(wait_for_started=3)
     monkeypatch.setattr(providers, "_ocr", provider)
     monkeypatch.setattr(
         pdf_handlers,
@@ -484,7 +524,7 @@ def test_multi_page_scanned_pdf_to_docx_keeps_page_order(
     text = "\n".join(p.text for p in Document(result["output_path"]).paragraphs)
     assert text.index("OCR PAGE 1") < text.index("OCR PAGE 2")
     assert text.index("OCR PAGE 2") < text.index("OCR PAGE 3")
-    assert provider.max_active >= 2
+    assert provider.max_active == 3
     assert not list(out_dir.glob("ocr-page-*.png"))
 ```
 
@@ -497,7 +537,7 @@ cd apps/api
 uv run pytest tests/test_pdf_ocr.py -q
 ```
 
-Expected: all tests pass, including real multi-page PDF → DOCX generation.
+Expected: all tests pass, including the isolated real-render subprocess and real multi-page PDF → DOCX generation. The Provider barrier observes `max_active == 3` even though PDFium rendering is process-globally serialized.
 
 - [ ] **Step 11: Commit the concurrent extractor**
 
@@ -709,7 +749,7 @@ docker compose logs --since=15m worker | rg "PDF OCR 启动：扫描页 4，页�
 docker compose exec worker sh -lc 'find /app/storage/workdirs -name "ocr-page-*.png" -print'
 ```
 
-Expected: the worker log reports 4 scanned pages with concurrency 3, and `find` prints no files. The automated `CoordinatedOCR` test is the timing-level proof that calls overlap; the Docker log proves the production path selected a three-worker pool.
+Expected: the worker log reports 4 scanned pages with OCR worker concurrency 3, and `find` prints no files. The automated barrier-backed `CoordinatedOCR` test is the timing-level proof that Provider calls overlap; the Docker log proves the production path selected a three-worker pool. Neither output implies concurrent PDFium rendering, which remains process-globally serialized.
 
 - [ ] **Step 12: Inspect real artifacts and recent logs**
 
@@ -728,6 +768,8 @@ Expected: no conversion error or traceback from the smoke jobs, artifacts are or
 
 - [ ] `PDF_OCR_PAGE_CONCURRENCY` defaults to 3 and clamps to 1–8.
 - [ ] Unit tests prove page OCR overlaps and never exceeds the configured limit.
+- [ ] An isolated subprocess test proves three concurrent production `_render_pdf_page` calls exit cleanly and create three non-empty PNGs under the process-level PDFium mutex.
+- [ ] The real multi-page DOCX integration test proves `OCRProvider` still reaches `max_active == 3` while PDFium rendering is serialized.
 - [ ] Mixed/native behavior and page order remain unchanged.
 - [ ] Failure stops undispatched work and cleans all started page images.
 - [ ] Cancellation during threaded rendering waits for the thread and leaves no page image behind.
