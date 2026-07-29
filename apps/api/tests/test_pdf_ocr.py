@@ -60,10 +60,13 @@ class CoordinatedOCR(OCRProvider):
     def __init__(
         self,
         delays: dict[int, float] | None = None,
-        fail_page: int | None = None,
+        fail_pages: set[int] | None = None,
+        wait_for_started: int | None = None,
     ) -> None:
         self.delays = delays or {}
-        self.fail_page = fail_page
+        self.fail_pages = fail_pages or set()
+        self.wait_for_started = wait_for_started
+        self._started_barrier = asyncio.Event()
         self.started: list[int] = []
         self.active = 0
         self.max_active = 0
@@ -80,8 +83,15 @@ class CoordinatedOCR(OCRProvider):
         self.active += 1
         self.max_active = max(self.max_active, self.active)
         try:
+            if (
+                self.wait_for_started is not None
+                and len(self.started) >= self.wait_for_started
+            ):
+                self._started_barrier.set()
+            if self.wait_for_started is not None:
+                await self._started_barrier.wait()
             await asyncio.sleep(self.delays.get(page_number, 0.03))
-            if page_number == self.fail_page:
+            if page_number in self.fail_pages:
                 raise ConversionError(ErrorCode.OCR_FAILED, f"第 {page_number} 页 OCR 失败")
             return OCRResult(
                 text=f"OCR PAGE {page_number}", tables=[], confidence=0.9,
@@ -283,7 +293,7 @@ def test_pdf_ocr_failure_stops_new_pages_and_cleans_inflight_images(
 ) -> None:
     provider = CoordinatedOCR(
         delays={1: 0.08, 2: 0.01, 3: 0.08},
-        fail_page=2,
+        fail_pages={2},
     )
     monkeypatch.setattr(providers, "_ocr", provider)
     monkeypatch.setattr(pdf_handlers, "_render_pdf_page", _fake_render_pdf_page)
@@ -303,6 +313,34 @@ def test_pdf_ocr_failure_stops_new_pages_and_cleans_inflight_images(
     assert exc.value.code == ErrorCode.OCR_FAILED
     assert set(provider.started) == {1, 2, 3}
     assert not list(tmp_path.glob("ocr-page-*.png"))
+
+
+def test_pdf_ocr_multiple_failures_raise_lowest_page_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = CoordinatedOCR(
+        delays={1: 0.05, 2: 0.0},
+        fail_pages={1, 2},
+        wait_for_started=2,
+    )
+    monkeypatch.setattr(providers, "_ocr", provider)
+    monkeypatch.setattr(pdf_handlers, "_render_pdf_page", _fake_render_pdf_page)
+    monkeypatch.setattr(
+        pdf_handlers,
+        "settings",
+        SimpleNamespace(pdf_ocr_page_concurrency=2),
+    )
+
+    with pytest.raises(ConversionError) as exc:
+        asyncio.run(
+            pdf_handlers._extract_pdf_text_with_ocr(
+                "unused.pdf", tmp_path, {}, _ocr_states(2),
+            )
+        )
+
+    assert exc.value.code == ErrorCode.OCR_FAILED
+    assert exc.value.message == "第 1 页 OCR 失败"
 
 
 def test_pdf_ocr_cancellation_waits_for_render_thread_before_cleanup(
