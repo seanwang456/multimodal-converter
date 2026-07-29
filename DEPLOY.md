@@ -99,7 +99,7 @@ docker compose pull && docker compose up -d --build   # 升级版本
 ## 8. 已知限制（务必告知）
 
 1. **ASR（音/视频→文字）**：支持三种后端（`ASR_PROVIDER`）：`aliyun`（阿里云千问3-ASR-Flash-Filetrans，推荐）/ `volcano`（火山豆包录音文件识别）/ `openai`（Whisper 兼容）。`aliyun` 与 `volcano` 均为「提交音频 URL + 轮询」模式，服务商从公网回拉音频，故**必须配置公网可达的 `PUBLIC_BASE_URL`**（部署时填 `https://<CADDY_DOMAIN>` 即可，`/api/asr-source/{token}` 已随 `/api/*` 被 Caddy 反代）；`openai` 模式直接上传字节，不需要。`PUBLIC_BASE_URL` 为空或为 `localhost` 时，回拉类 ASR 会返回 `ASR_FAILED`。注意：key 所在账号需在服务商控制台为对应模型开通授权，否则返回 `access_denied`。
-2. **并发**：任务并发默认 4（`MAX_CONCURRENT_JOBS`）；单份扫描 PDF 页级 OCR 并发默认 3（`PDF_OCR_PAGE_CONCURRENCY`），单 worker 理论峰值为 12 个 PDF OCR 请求。模型服务限流、内存较小或 LibreOffice 负载较重时，优先将两者分别降为 1–2 和 2。
+2. **并发**：任务并发默认 4（`MAX_CONCURRENT_JOBS`）；单份扫描 PDF 的 OCR Provider 页级并发默认 3（`PDF_OCR_PAGE_CONCURRENCY`），单 worker 理论峰值为 12 个 PDF OCR 请求。PDFium 页面渲染仍保持进程内全局串行，不会与 OCR Provider 调用一样并发。模型服务限流、内存较小或 LibreOffice 负载较重时，优先将两者分别降为 1–2 和 2；将 `PDF_OCR_PAGE_CONCURRENCY=1` 可恢复单份 PDF 的逐页串行 OCR。
 3. **单机部署**：1 worker + SQLite。要多副本横向扩展需迁移到 PostgreSQL + 多 worker（代码已抽象 JobRunner/Storage，可平滑迁移）。
 4. **无限流 / 无队列上限**：公网暴露建议在 Caddy 前再加一层限流（或 WAF）。
 

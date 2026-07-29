@@ -51,7 +51,7 @@ docker compose up -d --wait      # 退出码 0 = 全部健康
 
 PDF 页面没有可用文本层时会自动转为图片并调用 OCR。此时必须配置
 `LLM_BASE_URL`、`LLM_API_KEY` 和 `LLM_VISION_MODEL`；普通文字型 PDF 不调用 OCR。
-扫描页默认每份 PDF 同时识别 3 页，可通过 `PDF_OCR_PAGE_CONCURRENCY` 调整。该值会与 `MAX_CONCURRENT_JOBS` 相乘；默认单 worker 理论峰值为 12 个 PDF OCR 请求。模型限流或内存紧张时可降为 1–2。
+扫描页默认每份 PDF 同时识别 3 页，可通过 `PDF_OCR_PAGE_CONCURRENCY` 调整。该值会与 `MAX_CONCURRENT_JOBS` 相乘；默认单 worker 理论峰值为 12 个 PDF OCR 请求。这里的页级并发仅作用于 OCR Provider 调用，PDFium 页面渲染仍保持进程内全局串行。模型限流或内存紧张时可降为 1–2；将 `PDF_OCR_PAGE_CONCURRENCY=1` 可恢复单份 PDF 的逐页串行 OCR。
 
 不同 ASR 服务商的额外变量：`aliyun` → `ALIYUN_ASR_*`（key 默认复用 `LLM_API_KEY`）；`volcano` → `VOLCANO_ASR_*`；`openai` → `LLM_ASR_MODEL`（Whisper 兼容，无需 `PUBLIC_BASE_URL`）。完整清单见 `.env.example`。
 
