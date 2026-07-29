@@ -23,6 +23,16 @@ def _get_int(name: str, default: int) -> int:
         return default
 
 
+def _get_bounded_int(
+    name: str,
+    default: int,
+    minimum: int,
+    maximum: int,
+) -> int:
+    value = _get_int(name, default)
+    return min(max(value, minimum), maximum)
+
+
 @dataclass(frozen=True)
 class Settings:
     app_env: str = os.getenv("APP_ENV", "development")
@@ -32,6 +42,9 @@ class Settings:
     sqlite_path: Path = Path(os.getenv("SQLITE_PATH", "./storage/app.db"))
     file_retention_hours: int = _get_int("FILE_RETENTION_HOURS", 24)
     max_concurrent_jobs: int = _get_int("MAX_CONCURRENT_JOBS", 4)
+    pdf_ocr_page_concurrency: int = _get_bounded_int(
+        "PDF_OCR_PAGE_CONCURRENCY", 3, 1, 8,
+    )
     cleanup_interval_seconds: int = _get_int("CLEANUP_INTERVAL_SECONDS", 600)
 
     redis_url: str = os.getenv("REDIS_URL", "redis://localhost:6379/0")
