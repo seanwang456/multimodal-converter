@@ -52,7 +52,7 @@ PDF_OCR_PAGE_CONCURRENCY=3
 
 ### 页级工作池
 
-PDF handler 为每份 PDF 建立最多 3 个异步 worker，实际 worker 数量为“配置值”和“OCR 页面数”的较小值。每个 worker 执行：
+PDF handler 为每份 PDF 建立配置数量的异步 worker（默认 3，上限 8），实际 worker 数量为“配置值”和“OCR 页面数”的较小值。每个 worker 执行：
 
 1. 领取下一个待 OCR 的页面状态；
 2. 在线程池中渲染该页，避免阻塞事件循环；
@@ -74,8 +74,8 @@ PDF → TXT 和含扫描页的 PDF → DOCX 共用同一文本提取流程，所
 - 页面渲染失败继续返回 `CONVERSION_ENGINE_ERROR`。
 - OCR Provider 失败继续保留其结构化错误，例如 `OCR_FAILED`。
 - 任一页面失败后设置停止标记，不再领取尚未开始的新页面。
-- 已经开始的页面允许完成，以保证线程渲染结束后再安全删除临时文件；随后抛出已记录的第一个页面错误。
-- job 的现有 20 分钟 PDF 超时保持不变。超时取消时，每个协程仍通过 `finally` 清理已知临时图片，job runner 的 workdir 清理作为最终兜底。
+- 已经开始的页面允许完成，以保证线程渲染结束后再安全删除临时文件；如果同时记录多个错误，按原始页码选择最前一页的错误抛出，使结果可重复。
+- job 的现有 20 分钟 PDF 超时保持不变。渲染调用使用可等待的独立 task；如果 job 在 `asyncio.to_thread` 渲染期间被取消，协程先等待该渲染线程结束，再删除临时图片并继续传播取消。Provider 调用期间被取消则直接进入 `finally` 清理。job runner 在 handler 完成取消后再清理 workdir，作为最终兜底。
 
 这里不在首次失败时直接取消正在执行的 `asyncio.to_thread`：取消 await 不会停止底层渲染线程，过早删除文件可能造成线程稍后重新写出残留图片。
 
