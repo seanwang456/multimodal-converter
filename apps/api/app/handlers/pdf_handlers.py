@@ -13,6 +13,7 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
+from app.config import settings
 from app.errors import ConversionError, ErrorCode
 from app.handlers.base import ConversionHandler, ConversionResult
 from app.handlers.docgen import write_docx, write_pptx
@@ -20,6 +21,8 @@ from app.providers import get_ocr_provider
 
 PDF_TARGETS = {".txt", ".docx", ".pptx", ".xlsx"}
 OCR_QUALITY_NOTICE = "扫描页面经 OCR 识别，复杂版面、手写内容或低清晰度页面可能存在误差。"
+
+log = logging.getLogger(__name__)
 
 
 @dataclass(frozen=True)
@@ -109,6 +112,24 @@ def _render_pdf_page(input_path: str, page_index: int, dest: Path) -> None:
         page_image.save(str(dest), format="PNG")
 
 
+async def _render_pdf_page_for_ocr(
+    input_path: str,
+    page_index: int,
+    dest: Path,
+) -> None:
+    render_task = asyncio.create_task(
+        asyncio.to_thread(_render_pdf_page, input_path, page_index, dest),
+    )
+    try:
+        await asyncio.shield(render_task)
+    except asyncio.CancelledError:
+        try:
+            await render_task
+        except Exception:  # cancellation remains the externally visible result
+            pass
+        raise
+
+
 async def _extract_pdf_text_with_ocr(
     input_path: str,
     output_dir: Path,
@@ -116,40 +137,76 @@ async def _extract_pdf_text_with_ocr(
     pages: list[PdfPageState] | None = None,
 ) -> PdfTextResult:
     """按页合并原生文本与 OCR 文本，并及时清理渲染图片。"""
-    states = pages if pages is not None else await asyncio.to_thread(_inspect_pdf_pages, input_path)
-    provider = get_ocr_provider() if any(page.needs_ocr for page in states) else None
-    parts: list[str] = []
-    ocr_pages = 0
+    states = pages if pages is not None else await asyncio.to_thread(
+        _inspect_pdf_pages, input_path,
+    )
+    ocr_states = [state for state in states if state.needs_ocr]
+    provider = get_ocr_provider() if ocr_states else None
+    parts = [
+        state.native_text.strip() if not state.needs_ocr else ""
+        for state in states
+    ]
 
-    for state in states:
-        if not state.needs_ocr:
-            parts.append(state.native_text.strip())
-            continue
+    if not ocr_states:
+        return PdfTextResult(text="\n\n".join(parts).strip(), ocr_pages=0)
+    if provider is None:
+        raise ConversionError(ErrorCode.OCR_FAILED, "OCR Provider 不可用")
 
-        image_path = output_dir / f"ocr-page-{state.index + 1}.png"
-        try:
+    worker_count = min(settings.pdf_ocr_page_concurrency, len(ocr_states))
+    next_position = 0
+    stop = asyncio.Event()
+    errors: list[tuple[int, Exception]] = []
+    log.info(
+        "PDF OCR 启动：扫描页 %d，页级并发 %d",
+        len(ocr_states),
+        worker_count,
+    )
+
+    async def worker() -> None:
+        nonlocal next_position
+        while not stop.is_set() and next_position < len(ocr_states):
+            state = ocr_states[next_position]
+            next_position += 1
+            image_path = output_dir / f"ocr-page-{state.index + 1}.png"
             try:
-                await asyncio.to_thread(
-                    _render_pdf_page, input_path, state.index, image_path,
+                try:
+                    await _render_pdf_page_for_ocr(
+                        input_path, state.index, image_path,
+                    )
+                except asyncio.CancelledError:
+                    raise
+                except Exception as exc:
+                    raise ConversionError(
+                        ErrorCode.CONVERSION_ENGINE_ERROR,
+                        "PDF 页面渲染失败",
+                    ) from exc
+                result = await provider.extract_text(
+                    str(image_path),
+                    language=options.get("ocr_language", "auto"),
+                    detect_tables=options.get("detect_tables", True),
+                    preserve_layout=options.get("preserve_layout", False),
                 )
-            except Exception as e:
-                raise ConversionError(
-                    ErrorCode.CONVERSION_ENGINE_ERROR, "PDF 页面渲染失败",
-                ) from e
-            if provider is None:  # 仅用于类型收窄，正常路径不会发生
-                raise ConversionError(ErrorCode.OCR_FAILED, "OCR Provider 不可用")
-            result = await provider.extract_text(
-                str(image_path),
-                language=options.get("ocr_language", "auto"),
-                detect_tables=options.get("detect_tables", True),
-                preserve_layout=options.get("preserve_layout", False),
-            )
-            parts.append((result.get("text") or "").strip())
-            ocr_pages += 1
-        finally:
-            image_path.unlink(missing_ok=True)
+                parts[state.index] = (result.get("text") or "").strip()
+            except asyncio.CancelledError:
+                raise
+            except Exception as exc:
+                errors.append((state.index, exc))
+                stop.set()
+            finally:
+                image_path.unlink(missing_ok=True)
 
-    return PdfTextResult(text="\n\n".join(parts).strip(), ocr_pages=ocr_pages)
+    async with asyncio.TaskGroup() as group:
+        for _ in range(worker_count):
+            group.create_task(worker())
+
+    if errors:
+        errors.sort(key=lambda item: item[0])
+        raise errors[0][1]
+
+    return PdfTextResult(
+        text="\n\n".join(parts).strip(),
+        ocr_pages=len(ocr_states),
+    )
 
 
 def _ocr_quality_notice(result: PdfTextResult) -> str:
