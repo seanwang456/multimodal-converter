@@ -262,6 +262,38 @@ def test_scanned_pdf_to_docx_contains_editable_ocr_text(
     assert "OCR" in (result["quality_notice"] or "")
 
 
+def test_scanned_pdf_to_pptx_contains_ocr_text_and_forwards_options(
+    tmp_path: Path, ocr_provider: RecordingOCR,
+) -> None:
+    from pptx import Presentation
+
+    src = _make_scanned_pdf(tmp_path / "scan.pdf")
+    out_dir = tmp_path / "out"
+    out_dir.mkdir()
+
+    result = _run(
+        "pdf_to_pptx",
+        src,
+        out_dir,
+        ".pptx",
+        {"ocr_language": "zh", "detect_tables": False, "preserve_layout": True},
+    )
+
+    presentation = Presentation(result["output_path"])
+    visible_text = [
+        shape.text
+        for slide in presentation.slides
+        for shape in slide.shapes
+        if hasattr(shape, "text") and shape.text.strip()
+    ]
+    assert any("扫描页 OCR 文字" in text for text in visible_text)
+    assert ocr_provider.calls == [
+        {"language": "zh", "detect_tables": False, "preserve_layout": True}
+    ]
+    assert "OCR" in (result["quality_notice"] or "")
+    assert not list(out_dir.glob("ocr-page-*.png"))
+
+
 def test_mixed_pdf_keeps_page_order_and_ocrs_only_scan_page(
     tmp_path: Path, ocr_provider: RecordingOCR,
 ) -> None:

@@ -55,16 +55,6 @@ def _is_encrypted_pdf(input_path: str) -> bool:
         return False
 
 
-def _extract_pdf_text(input_path: str) -> str:
-    import pdfplumber
-
-    parts: list[str] = []
-    with pdfplumber.open(input_path) as pdf:
-        for page in pdf.pages:
-            parts.append(page.extract_text() or "")
-    return "\n\n".join(parts).strip()
-
-
 def _has_page_sized_image(page) -> bool:  # noqa: ANN001
     """页面存在覆盖至少一半版面的图片时，视为可能包含扫描正文。"""
     page_area = float(page.width * page.height)
@@ -306,7 +296,7 @@ class PdfHandler(ConversionHandler):
             )
 
         pages: list[PdfPageState] | None = None
-        if target_ext in {".txt", ".docx"}:
+        if target_ext in {".txt", ".docx", ".pptx"}:
             try:
                 pages = await asyncio.to_thread(_inspect_pdf_pages, input_path)
             except Exception as e:
@@ -368,20 +358,20 @@ class PdfHandler(ConversionHandler):
                 ),
             )
 
-        # PPTX：保持现有原生文本提取行为，本次不扩展扫描页 OCR
-        try:
-            text = await asyncio.to_thread(_extract_pdf_text, input_path)
-        except Exception as e:
-            if _is_password_error(e):
-                raise ConversionError(ErrorCode.PASSWORD_PROTECTED_PDF, "PDF 已加密，请解除密码后重新上传") from e
-            raise ConversionError(ErrorCode.CONVERSION_ENGINE_ERROR, "PDF 文本提取失败") from e
-
-        out = out_dir / f"result{target_ext}"
-        if target_ext == ".pptx":
-            await asyncio.to_thread(write_pptx, text, out)
+        # PDF → PPTX：原生文本页直接提取，扫描页按需 OCR
+        assert pages is not None
+        extracted = await _extract_pdf_text_with_ocr(
+            input_path, out_dir, options, pages,
+        )
+        out = out_dir / "result.pptx"
+        await asyncio.to_thread(write_pptx, extracted.text, out)
         return ConversionResult(
             output_path=str(out), filename=out.name, size_bytes=out.stat().st_size,
-            quality_notice="PDF 转文档为 best-effort，复杂排版可能无法完全还原。",
+            quality_notice=(
+                _ocr_quality_notice(extracted)
+                if extracted.ocr_pages
+                else "PDF 转 PPT 为 best-effort，复杂排版可能无法完全还原。"
+            ),
         )
 
 
